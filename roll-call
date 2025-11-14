@@ -1,0 +1,519 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+import { ListChecks, Clock, XCircle, Settings, Loader2, FileText, RotateCcw } from 'lucide-react';
+
+// --- Firebase Configuration and Initialization ---
+// 確保配置安全解析，避免 JSON 錯誤
+const firebaseConfig = (() => {
+    try {
+        return typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+    } catch (e) {
+        console.error("Failed to parse __firebase_config:", e);
+        return {};
+    }
+})();
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-roll-call-app';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// 定義狀態及其樣式 
+const STATUSES = {
+    present: { label: '出席', color: 'bg-green-100 text-green-700 hover:bg-green-200', icon: ListChecks, tailwindColor: 'text-green-500' },
+    late: { label: '遲到', color: 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200', icon: Clock, tailwindColor: 'text-yellow-500' },
+    absent: { label: '缺席', color: 'bg-red-100 text-red-700 hover:bg-red-200', icon: XCircle, tailwindColor: 'text-red-500' },
+};
+const STATUS_KEYS = Object.keys(STATUSES); 
+
+/**
+ * 缺席與遲到清單彈出視窗
+ */
+const ReportModal = ({ onClose, lateList, absentList }) => {
+    return (
+        // 模態背景
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900 bg-opacity-75" 
+             onClick={onClose}>
+            {/* 模態內容容器 */}
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 transition-all transform duration-300 scale-100 opacity-100" 
+                 onClick={(e) => e.stopPropagation()}>
+                
+                <div className="flex justify-between items-center border-b pb-3 mb-4">
+                    <h2 className="text-2xl font-bold text-gray-800">缺席與遲到清單報告</h2>
+                    <button onClick={onClose} className="text-gray-400 hover:text-gray-600 transition">
+                        <XCircle className="w-7 h-7" />
+                    </button>
+                </div>
+
+                {/* 缺席清單 (Absent) */}
+                <div className="mb-6">
+                    <h3 className={`text-xl font-semibold mb-3 ${STATUSES.absent.tailwindColor} flex items-center`}>
+                        <STATUSES.absent.icon className="w-5 h-5 inline mr-2" />
+                        {STATUSES.absent.label} ({absentList.length} 人)
+                    </h3>
+                    {absentList.length > 0 ? (
+                        <div className="flex flex-wrap gap-2 p-3 bg-red-50 rounded-lg border border-red-200">
+                            {absentList.map(s => (
+                                <span key={s.id} className="bg-red-200 text-red-800 px-3 py-1 rounded-full text-sm font-bold shadow-sm">
+                                    {s.id.toString().padStart(2, '0')} 號
+                                </span>
+                            ))}
+                        </div>
+                    ) : (
+                        // 缺席清單：顯示 "無"
+                        <p className="text-gray-500 p-3 bg-gray-50 rounded-lg">無</p>
+                    )}
+                </div>
+
+                {/* 遲到清單 (Late) */}
+                <div className="mb-6">
+                    <h3 className={`text-xl font-semibold mb-3 ${STATUSES.late.tailwindColor} flex items-center`}>
+                        <STATUSES.late.icon className="w-5 h-5 inline mr-2" />
+                        {STATUSES.late.label} ({lateList.length} 人)
+                    </h3>
+                    {lateList.length > 0 ? (
+                        <div className="flex flex-wrap gap-2 p-3 bg-yellow-50 rounded-lg border border-yellow-200">
+                            {lateList.map(s => (
+                                <span key={s.id} className="bg-yellow-200 text-yellow-800 px-3 py-1 rounded-full text-sm font-bold shadow-sm">
+                                    {s.id.toString().padStart(2, '0')} 號
+                                </span>
+                            ))}
+                        </div>
+                    ) : (
+                        // 遲到清單：更新為 "無"
+                        <p className="text-gray-500 p-3 bg-gray-50 rounded-lg">無</p>
+                    )}
+                </div>
+
+                <div className="mt-6 pt-4 border-t">
+                    <button onClick={onClose} className="w-full py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition font-semibold shadow-md">
+                        確認並關閉報告
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+/**
+ * 主要應用程式組件
+ */
+const App = () => {
+    // Firebase 狀態
+    const [db, setDb] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [isDataLoading, setIsDataLoading] = useState(true);
+    
+    // 應用程式狀態
+    const [maxNumber, setMaxNumber] = useState(38); 
+    const [students, setStudents] = useState([]);
+    const [inputMax, setInputMax] = useState(38);
+    const [error, setError] = useState(null);
+    const [isReportModalOpen, setIsReportModalOpen] = useState(false); 
+    const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false); 
+
+    // --- 1. Firebase 初始化與認證 ---
+    useEffect(() => {
+        // 檢查配置是否完整
+        if (!firebaseConfig.apiKey) {
+            setError("錯誤：Firebase 配置資訊遺失。資料儲存功能無法啟動。");
+            setIsAuthReady(true);
+            setIsDataLoading(false);
+            return;
+        }
+
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestore = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+            setDb(firestore);
+
+            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                    console.log("Firebase Auth Ready. User ID:", user.uid);
+                } else if (!initialAuthToken) {
+                    // 如果沒有 Custom Token，則嘗試匿名登入
+                    await signInAnonymously(firebaseAuth).catch(err => console.error("Anonymous sign-in failed:", err));
+                }
+                setIsAuthReady(true);
+            });
+
+            if (initialAuthToken) {
+                // 如果有 Custom Token，優先使用 Custom Token 登入
+                signInWithCustomToken(firebaseAuth, initialAuthToken).catch(e => {
+                    console.error("Custom token sign-in failed, falling back to anonymous sign-in.", e);
+                    signInAnonymously(firebaseAuth).catch(err => console.error("Anonymous sign-in failed:", err));
+                });
+            }
+
+            return () => unsubscribe();
+        } catch (e) {
+            console.error("Firebase Initialization Error:", e);
+            setError(`Firebase 服務初始化失敗: ${e.message}。`);
+            setIsAuthReady(true); 
+            setIsDataLoading(false);
+        }
+    }, []);
+
+    // --- Firestore 路徑定義 ---
+    const getDocRef = useCallback(() => {
+        if (!db || !userId) return null;
+        const collectionPath = `/artifacts/${appId}/users/${userId}/roll_call_data`;
+        const documentPath = 'state';
+        return doc(db, collectionPath, documentPath);
+    }, [db, userId]);
+
+    // --- 3. 資料持久化邏輯 ---
+    // 使用非同步函式來確保寫入操作完成
+    const updateFirestoreState = useCallback(async (newMaxNumber, newStudents) => {
+        const docRef = getDocRef();
+        if (!docRef) return;
+
+        const dataToSave = {
+            maxNumber: newMaxNumber,
+            students: newStudents,
+            updatedAt: new Date().toISOString()
+        };
+
+        try {
+            await setDoc(docRef, dataToSave, { merge: true });
+        } catch (e) {
+            console.error("Error saving state to Firestore:", e);
+            setError("資料保存失敗，請檢查網路連線。");
+        }
+    }, [getDocRef]);
+
+    // --- 輔助函數：生成/更新/清洗學生列表 ---
+    const generateStudentList = useCallback((newMax, currentStudents, isReset = false) => {
+        const validStatuses = Object.keys(STATUSES); 
+        const newStudents = [];
+        let needsCleanup = false;
+
+        for (let i = 1; i <= newMax; i++) {
+            const existing = currentStudents.find(s => s.id === i);
+            let status = 'present'; // 預設為出席
+            
+            if (!isReset && existing) {
+                // 檢查現有狀態是否在有效列表中
+                if (validStatuses.includes(existing.status)) {
+                    status = existing.status;
+                } else {
+                    // 如果狀態無效（例如舊的 'default' 或 corrupted data），則需清洗
+                    needsCleanup = true; 
+                    status = 'present'; // 強制設為 'present'
+                }
+            }
+
+            newStudents.push({
+                id: i,
+                status: status
+            });
+        }
+        return { students: newStudents, needsCleanup };
+    }, []); 
+
+    // --- 2. 數據載入 (On Snapshot) ---
+    useEffect(() => {
+        // 只有在 Firebase 認證完成後才嘗試載入數據
+        if (!isAuthReady || !userId || !db) return;
+
+        const docRef = getDocRef();
+        if (!docRef) {
+            // 如果無法獲取文檔引用，說明初始化或認證仍有問題
+            setIsDataLoading(false); 
+            return;
+        }
+        
+        const unsubscribe = onSnapshot(docRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                const maxNum = data.maxNumber && typeof data.maxNumber === 'number' ? data.maxNumber : 38;
+                const studentData = Array.isArray(data.students) ? data.students : [];
+
+                const { students: cleanedStudents, needsCleanup } = generateStudentList(maxNum, studentData, false); 
+                
+                setMaxNumber(maxNum);
+                setInputMax(maxNum);
+                setStudents(cleanedStudents);
+                
+                if (needsCleanup) {
+                     // 靜默更新，將不正確的狀態寫回 'present'
+                     updateFirestoreState(maxNum, cleanedStudents);
+                }
+
+            } else {
+                // 資料庫中沒有數據，初始化預設狀態
+                const { students: defaultStudents } = generateStudentList(38, [], false);
+                updateFirestoreState(38, defaultStudents);
+            }
+            setIsDataLoading(false);
+        }, (err) => {
+            console.error("Firestore onSnapshot error:", err);
+            setError("無法從資料庫載入資料。請嘗試重啟或清除快取。");
+            setIsDataLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, [isAuthReady, userId, db, getDocRef, generateStudentList, updateFirestoreState]);
+
+    // --- 4. 處理最大號碼設定 ---
+    const handleSetMax = (e) => {
+        e.preventDefault();
+        setError(null);
+        const newMax = parseInt(inputMax, 10);
+
+        if (isNaN(newMax) || newMax < 1 || newMax > 999) {
+            setError('請輸入 1 到 999 之間的有效號碼。');
+            return;
+        }
+
+        const { students: updatedStudents } = generateStudentList(newMax, students, false);
+        
+        setMaxNumber(newMax);
+        setStudents(updatedStudents);
+        updateFirestoreState(newMax, updatedStudents);
+    };
+
+    // --- 5. 處理狀態更新 ---
+    const handleUpdateStatus = useCallback((studentId, newStatus) => {
+        const updatedStudents = students.map(student => 
+            student.id === studentId ? { ...student, status: newStatus } : student
+        );
+        setStudents(updatedStudents);
+        updateFirestoreState(maxNumber, updatedStudents);
+
+    }, [students, maxNumber, updateFirestoreState]);
+
+    // --- 6. 處理一鍵重置狀態 ---
+    const handleResetAllStatuses = () => {
+        setIsConfirmModalOpen(false); 
+        setError(null);
+
+        // 強制將狀態設為 'present'
+        const { students: resetStudents } = generateStudentList(maxNumber, students, true);
+        
+        setStudents(resetStudents);
+        updateFirestoreState(maxNumber, resetStudents);
+    }
+
+
+    // --- 7. 統計數據計算與清單過濾 ---
+    const { statusCounts, lateStudents, absentStudents } = useMemo(() => {
+        const counts = { present: 0, late: 0, absent: 0 };
+        const late = [];
+        const absent = [];
+        
+        students.forEach(student => {
+            // 在計算時，即使有萬一，也確保 status 是一個有效的 key
+            const status = student.status && STATUSES[student.status] ? student.status : 'present'; 
+            
+            if (counts.hasOwnProperty(status)) {
+                counts[status] += 1;
+            } 
+
+            if (status === 'late') {
+                late.push(student);
+            } else if (status === 'absent') {
+                absent.push(student);
+            }
+        });
+        return { statusCounts: counts, lateStudents: late, absentStudents: absent };
+    }, [students]);
+
+    // --- 渲染部分 ---
+    if (!isAuthReady || isDataLoading) {
+        return (
+            <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 p-4">
+                <Loader2 className="w-10 h-10 text-indigo-500 animate-spin" />
+                <p className="mt-4 text-gray-600">載入中... (正在初始化資料庫)</p>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-gray-50 p-4 sm:p-8">
+            <div className="max-w-4xl mx-auto">
+                
+                {/* 標題與報告按鈕 */}
+                <div className="flex justify-between items-center mb-6">
+                    <h1 className="text-3xl font-extrabold text-gray-900">
+                        點名
+                    </h1>
+                    <button
+                        onClick={() => setIsReportModalOpen(true)}
+                        className="flex items-center py-2 px-4 rounded-lg shadow-md text-sm font-medium text-white bg-red-600 hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition duration-150 ease-in-out transform hover:scale-[1.01] active:scale-95"
+                    >
+                        <FileText className="w-4 h-4 mr-2" />
+                        查看缺席報告 ({absentStudents.length + lateStudents.length} 人)
+                    </button>
+                </div>
+                
+                {/* 用戶 ID 提示 */}
+                <div className="mb-4 text-xs text-center text-gray-500 break-all p-2 bg-gray-100 rounded-lg">
+                    資料儲存 ID: <span className="font-mono">{userId || '匿名用戶'}</span>
+                </div>
+
+                {/* 錯誤訊息 */}
+                {error && (
+                    <div className="p-3 mb-4 text-sm font-medium text-red-700 bg-red-100 rounded-lg">
+                        {error}
+                    </div>
+                )}
+                
+                {/* 狀態總結卡片 (使用 grid-cols-3) */}
+                <div className="grid grid-cols-3 gap-4 mb-8">
+                    {STATUS_KEYS.map(key => {
+                        const status = STATUSES[key];
+                        return (
+                            <div key={key} className={`p-4 rounded-xl shadow-lg flex flex-col items-center border-l-4 ${status.color.split(' ')[0]} ${status.color.split(' ')[1]} border-${status.tailwindColor.split('-')[1]}-400`}>
+                                <status.icon className={`w-6 h-6 mb-1 ${status.tailwindColor}`} />
+                                <span className="text-lg font-semibold">{status.label}</span>
+                                <span className="text-3xl font-bold mt-1">{statusCounts[key]}</span>
+                            </div>
+                        );
+                    })}
+                </div>
+
+                {/* 設定區域 */}
+                <form onSubmit={handleSetMax} className="bg-white p-5 rounded-xl shadow-lg mb-8 border border-gray-200">
+                    <div className="flex flex-col gap-4">
+                        {/* 頂部設定區塊 */}
+                        <div className="flex flex-col sm:flex-row items-end gap-3">
+                            <div className="flex-grow w-full">
+                                {/* 核心更新點：修改標籤文字 */}
+                                <label htmlFor="inputMax" className="block text-sm font-medium text-gray-700 mb-1">
+                                    設定班級人數 (1 ~ 999)
+                                </label>
+                                <input
+                                    type="number"
+                                    id="inputMax"
+                                    value={inputMax}
+                                    onChange={(e) => setInputMax(e.target.value)}
+                                    min="1"
+                                    max="999"
+                                    placeholder="例如: 38"
+                                    className="w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500 text-lg"
+                                />
+                            </div>
+                            <button
+                                type="submit"
+                                className="w-full sm:w-auto flex-shrink-0 flex justify-center py-2 px-6 border border-transparent rounded-lg shadow-md text-base font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 ease-in-out"
+                            >
+                                <Settings className="w-5 h-5 mr-2" />
+                                生成/更新列表 ({maxNumber} 人)
+                            </button>
+                        </div>
+                        
+                        {/* 重置按鈕 */}
+                        <div className="pt-3 border-t border-gray-100">
+                            <button
+                                type="button"
+                                onClick={() => setIsConfirmModalOpen(true)} 
+                                className="w-full flex justify-center py-2 px-6 border border-transparent rounded-lg shadow-md text-base font-medium text-red-600 bg-red-100 hover:bg-red-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition duration-150 ease-in-out"
+                            >
+                                <RotateCcw className="w-5 h-5 mr-2" />
+                                一鍵重置所有點名狀態 (全部設為出席)
+                            </button>
+                        </div>
+                    </div>
+                </form>
+
+                {/* 學生點名列表 */}
+                <div className="bg-white p-4 sm:p-6 rounded-xl shadow-2xl border border-gray-200">
+                    <h2 className="text-xl font-bold text-gray-800 mb-4 border-b pb-2">學生列表 (共 {maxNumber} 人)</h2>
+                    
+                    <div className="space-y-3">
+                        {students.map(student => {
+                            // 確保 currentStatus 即使在數據載入瞬時錯誤時也能安全地回退到 'present'
+                            const currentStatus = STATUSES[student.status] || STATUSES.present; 
+                            return (
+                                <div key={student.id} className="flex flex-col sm:flex-row items-center justify-between p-3 border border-gray-100 rounded-lg bg-white shadow-sm transition duration-100 hover:shadow-md">
+                                    {/* 號碼顯示 */}
+                                    <div className={`flex items-center w-full sm:w-1/3 mb-2 sm:mb-0 ${currentStatus.tailwindColor}`}>
+                                        <div className={`p-2 rounded-full ${currentStatus.color.split(' ')[0]} mr-3`}>
+                                            <currentStatus.icon className="w-5 h-5" />
+                                        </div>
+                                        <span className="text-xl font-extrabold">{student.id.toString().padStart(2, '0')} 號</span>
+                                    </div>
+                                    
+                                    {/* 狀態按鈕組 */}
+                                    <div className="flex space-x-2 w-full sm:w-2/3 justify-end">
+                                        {STATUS_KEYS.map(key => {
+                                            const status = STATUSES[key];
+                                            const isSelected = student.status === key;
+                                            return (
+                                                <button
+                                                    key={key}
+                                                    onClick={() => handleUpdateStatus(student.id, key)}
+                                                    className={`
+                                                        px-3 py-1.5 text-sm font-medium rounded-full transition-all duration-150
+                                                        ${isSelected 
+                                                            ? `shadow-lg ring-2 ring-offset-2 ${status.tailwindColor.replace('text', 'ring')} bg-opacity-90`
+                                                            : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                                                        }
+                                                        ${status.tailwindColor}
+                                                    `}
+                                                >
+                                                    {status.label}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                    {students.length === 0 && (
+                        <p className="text-center text-gray-500 py-4">請設定班級人數以開始點名。</p>
+                    )}
+                </div>
+            </div>
+            
+            {/* 報告 Modal 渲染 */}
+            {isReportModalOpen && (
+                <ReportModal
+                    onClose={() => setIsReportModalOpen(false)}
+                    absentList={absentStudents}
+                    lateList={lateStudents}
+                />
+            )}
+
+            {/* 確認重置 Modal 渲染 */}
+            {isConfirmModalOpen && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900 bg-opacity-75" 
+                    onClick={() => setIsConfirmModalOpen(false)}>
+                    <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6" 
+                        onClick={(e) => e.stopPropagation()}>
+                        
+                        <h3 className="text-xl font-bold text-gray-800 mb-4 flex items-center text-red-600">
+                            <RotateCcw className="w-6 h-6 mr-2" />
+                            確認重置所有點名狀態
+                        </h3>
+                        <p className="text-gray-600 mb-6">
+                            您確定要將所有 {maxNumber} 位學生的狀態全部重設為「出席」嗎？此操作將覆蓋現有紀錄。
+                        </p>
+                        
+                        <div className="flex justify-end space-x-3">
+                            <button
+                                onClick={() => setIsConfirmModalOpen(false)}
+                                className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 font-medium transition"
+                            >
+                                取消
+                            </button>
+                            <button
+                                onClick={handleResetAllStatuses}
+                                className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 font-semibold shadow-md transition"
+                            >
+                                確認重置
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default App;
